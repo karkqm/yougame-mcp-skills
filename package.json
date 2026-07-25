@@ -1,0 +1,38 @@
+{
+  "name": "yougame-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP-сервер для форума yougame.biz (XenForo 2.3): разделы, темы, статьи, комментарии, поиск, авторизация, скачивание ресурсов, база инструментов разработки и гейт «сначала ресерч, потом код».",
+  "bin": {
+    "yougame-mcp": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "start": "node dist/index.js",
+    "install-skill": "node scripts/install-skill.mjs",
+    "gen-docs": "node scripts/gen-skill-docs.mjs --with-map",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:mcp": "node scripts/mcp-smoke.mjs",
+    "smoke:kb": "node scripts/kb-smoke.mjs",
+    "setup": "npm install && npm run build && npm run install-skill -- --force",
+    "install-browser": "playwright install chromium"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "cheerio": "1.0.0",
+    "tough-cookie": "^6.0.2",
+    "zod": "^3.25.76"
+  },
+  "optionalDependencies": {
+    "playwright": "^1.49.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "yougame": {
+      "command": "node",
+      "args": ["/абсолютный/путь/до/yougame-mcp-skills/dist/index.js"]
+    }
+  }
+}

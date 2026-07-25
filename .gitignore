@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+.env
+downloads/
+browser-profile/
+cookies.json
+
+# Путь до dist/index.js у каждого свой — шаблон лежит в .mcp.json.example
+.mcp.json
