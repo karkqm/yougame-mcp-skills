@@ -16,7 +16,8 @@ import { ucConfig } from './config.js';
 import { AuthRequiredError, BrowserUnavailableError } from '../errors.js';
 import { clearJar } from './http/jar.js';
 import { dropCache } from './http/client.js';
-import { interactiveLogin } from './browser.js';
+import { interactiveLogin, passCloudflare } from './browser.js';
+import { clearSessionUserAgent } from './session-ua.js';
 import { classify, instructionFor } from '../resources/hosts.js';
 
 type ToolResult = {
@@ -125,23 +126,23 @@ Use uc_categories to get actual section IDs.`;
 
         const auth = `# UC Auth and Cloudflare
 
-unknowncheats.me is behind Cloudflare. Plain HTTP from Node often gets
-HTTP 403 "Just a moment..." — a JS challenge that only a real browser can pass.
+unknowncheats.me sits behind Cloudflare. Node fetch always fails (TLS/JA3 fingerprint),
+even with a stolen cf_clearance cookie. All UC tools go through a real Edge/Chrome session.
 
 Workflow:
-1. Call uc_login — opens Chromium with a persistent profile.
-2. Wait for Cloudflare to clear (title is no longer "Just a moment...").
-   The browser solves the challenge automatically; cf_clearance cookie is saved.
-3. If not already signed in, log into the forum (bbuserid cookie).
-4. Cookies (including cf_clearance) are imported into the HTTP jar for all tools.
-5. uc_auth_status — check session; uc_logout — wipe cookies.
+1. uc_cf_pass — opens your real Edge/Chrome (dedicated UC profile).
+   If Cloudflare/captcha appears: complete it MANUALLY in that window, do not close it.
+2. After CF is clear, public pages work via browser transport.
+3. uc_login — same browser; log into the forum for search / member content.
+4. uc_auth_status / uc_logout.
 
-If tools return AUTH_REQUIRED mentioning Cloudflare:
-- Run uc_login again (even without full forum login, cf_clearance alone unlocks public pages).
-- Keep the browser open longer if the challenge is slow (timeoutSec up to 1800).
-- Ensure Chromium is installed: npx playwright install chromium
+Optional env:
+- UC_BROWSER_PATH — path to msedge.exe / chrome.exe
+- UC_CDP_URL or UC_CDP_PORT — attach to an already-running browser with remote debugging
+- UC_USER_DATA_DIR — custom profile dir (default ~/.uc-mcp/browser-profile)
 
-Public pages may work after CF clearance alone; search and some downloads still need forum login.`;
+Note: Chrome 136+ blocks remote debugging on the *default* profile. We use a dedicated
+UC profile with your real Edge binary so TLS looks real. Your everyday Edge can stay open.`;
 
         if (t === 'navigation') return ok(nav);
         if (t === 'search') return ok(searchGuide);
@@ -166,21 +167,42 @@ Public pages may work after CF clearance alone; search and some downloads still 
   );
 
   server.registerTool(
-    'uc_login',
+    'uc_cf_pass',
     {
-      title: 'Login to UnknownCheats',
+      title: 'Pass Cloudflare for UnknownCheats',
       description:
-        'Open a real browser window with the UC login page for manual sign-in (password, captcha, 2FA). After login, cookies are saved and used by all other tools.',
+        'Open real Chrome, wait for Cloudflare cf_clearance, import cookies for HTTP tools. Use when tools get 403/Just a moment. Does not require forum login.',
       inputSchema: {
-        timeoutSec: z.number().int().min(30).max(1800).optional().describe('How long to wait for login, seconds (default 300).'),
-        keepOpen: z.boolean().optional().describe('Keep browser window open after login.'),
+        timeoutSec: z.number().int().min(30).max(1800).optional().describe('Seconds to wait for CF (default 300).'),
+        keepOpen: z.boolean().optional().describe('Keep browser open after pass.'),
       },
     },
     async ({ timeoutSec, keepOpen }) =>
       guard(async () => {
-        const result = await interactiveLogin({ timeoutSec, keepOpen });
+        const result = await passCloudflare({ timeoutSec, keepOpen });
         dropCache();
-        const status = result.loggedIn ? await authStatus() : null;
+        const status = await authStatus().catch(() => null);
+        return ok({ ...result, status });
+      }),
+  );
+
+  server.registerTool(
+    'uc_login',
+    {
+      title: 'Login to UnknownCheats',
+      description:
+        'Open a real browser window: pass Cloudflare first, then manual forum sign-in (password, captcha, 2FA). Cookies (cf_clearance + session) are saved for all tools.',
+      inputSchema: {
+        timeoutSec: z.number().int().min(30).max(1800).optional().describe('How long to wait for login, seconds (default 300).'),
+        keepOpen: z.boolean().optional().describe('Keep browser window open after login.'),
+        cfOnly: z.boolean().optional().describe('Only pass Cloudflare, skip waiting for forum login.'),
+      },
+    },
+    async ({ timeoutSec, keepOpen, cfOnly }) =>
+      guard(async () => {
+        const result = await interactiveLogin({ timeoutSec, keepOpen, cfOnly });
+        dropCache();
+        const status = await authStatus().catch(() => null);
         return ok({ ...result, status });
       }),
   );
@@ -189,13 +211,16 @@ Public pages may work after CF clearance alone; search and some downloads still 
     'uc_logout',
     {
       title: 'Clear UC session',
-      description: 'Delete stored UnknownCheats cookies from disk.',
+      description: 'Delete stored UnknownCheats cookies and session User-Agent from disk.',
       inputSchema: {},
     },
     async () =>
       guard(async () => {
         clearJar();
+        clearSessionUserAgent();
         dropCache();
+        const { closeBrowserSession } = await import('./http/browser-fetch.js');
+        await closeBrowserSession().catch(() => undefined);
         return ok({ ok: true, message: 'Cookies deleted: ' + ucConfig.cookiesPath });
       }),
   );
@@ -408,7 +433,7 @@ Public pages may work after CF clearance alone; search and some downloads still 
         // Browser download
         try {
           const { browserDownload: bd } = await import('./browser.js');
-          const result = await bd(fileUrl, dest, { headless: headless ?? false });
+          const result = await bd(fileUrl, dest, {});
           return ok({
             ok: true,
             filePath: result.filePath,

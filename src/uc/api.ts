@@ -1,7 +1,8 @@
 import { ucConfig, ucUrl } from './config.js';
 import { AuthRequiredError, NotFoundError } from '../errors.js';
 import { getPage } from './http/client.js';
-import { hasSessionCookies } from './http/jar.js';
+import { hasSessionCookies, hasCloudflareCookies } from './http/jar.js';
+import { getHttpUserAgent } from './session-ua.js';
 import { parseForumIndex, parseThreadList, type CategoryBlock, type ForumNode, type ForumPage } from './parse/forum.js';
 import { parseSearchResults, type SearchResults } from './parse/search.js';
 import { parseThread, type ThreadPage } from './parse/thread.js';
@@ -42,6 +43,10 @@ export interface AuthStatus {
   username: string | null;
   userId: number | null;
   cookiesStored: boolean;
+  cloudflareCleared: boolean;
+  httpStatus: number;
+  challenge: boolean;
+  userAgent: string;
 }
 
 export async function authStatus(): Promise<AuthStatus> {
@@ -50,11 +55,16 @@ export async function authStatus(): Promise<AuthStatus> {
   const username = usernameMatch?.[1]?.trim() ?? null;
   const userIdMatch = page.html.match(/member\.php\?u=(\d+)/);
   const userId = userIdMatch ? Number.parseInt(userIdMatch[1], 10) : null;
+  const challenge = /Just a moment|challenge-platform|cf-chl-widget/i.test(page.html);
   return {
     loggedIn: page.loggedIn,
     username: page.loggedIn ? username : null,
     userId: page.loggedIn ? userId : null,
     cookiesStored: hasSessionCookies(),
+    cloudflareCleared: hasCloudflareCookies() && !challenge && page.status < 400,
+    httpStatus: page.status,
+    challenge,
+    userAgent: getHttpUserAgent(),
   };
 }
 

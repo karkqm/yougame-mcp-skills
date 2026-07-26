@@ -2,8 +2,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ucConfig } from './config.js';
 import { BrowserUnavailableError } from '../errors.js';
-import { cookiesForBrowser, saveJar, getJar } from './http/jar.js';
-import { dropCache } from './http/client.js';
+import { cookiesForBrowser } from './http/jar.js';
+import {
+  browserHttp,
+  closeBrowserSession,
+  ensureBrowserSession,
+  importSessionCookies,
+  markCloudflareReady,
+  waitForCloudflareInSession,
+} from './http/browser-fetch.js';
+import { getHttpUserAgent } from './session-ua.js';
 
 type PlaywrightModule = typeof import('playwright');
 
@@ -17,189 +25,236 @@ async function loadPlaywright(): Promise<PlaywrightModule> {
   }
 }
 
-function launchArgs(headless: boolean) {
-  return {
-    headless,
-    args: ['--disable-blink-features=AutomationControlled'],
-  };
+export interface CfPassResult {
+  passed: boolean;
+  cookiesImported: number;
+  hasClearance: boolean;
+  httpStatus: number | null;
+  userAgent: string;
+  message: string;
+  browserPath?: string;
 }
 
-interface BrowserCookie {
-  name: string;
-  value: string;
-  domain: string;
-  path: string;
-  expires: number;
-  secure: boolean;
-  httpOnly: boolean;
-}
+/**
+ * Open real Edge/Chrome, wait for user to pass Cloudflare/captcha, keep session for tools.
+ */
+export async function passCloudflare(
+  opts: { timeoutSec?: number; keepOpen?: boolean } = {},
+): Promise<CfPassResult> {
+  const timeoutSec = opts.timeoutSec ?? ucConfig.loginTimeoutSec;
+  const keepOpen = opts.keepOpen ?? true;
 
-function importCookies(cookies: BrowserCookie[]): number {
-  const jar = getJar();
-  let count = 0;
-  const baseHost = new URL(ucConfig.baseUrl).hostname.replace(/^www\./, '');
-  for (const c of cookies) {
-    const domain = c.domain.replace(/^\./, '');
-    // Accept cookies for unknowncheats.me and its subdomains (including Cloudflare's cf_clearance)
-    if (!domain.includes(baseHost)) continue;
-    const parts = [`${c.name}=${c.value}`, `Domain=${c.domain}`, `Path=${c.path || '/'}`];
-    if (c.expires && c.expires > 0) parts.push(`Expires=${new Date(c.expires * 1000).toUTCString()}`);
-    if (c.secure) parts.push('Secure');
-    if (c.httpOnly) parts.push('HttpOnly');
+  await closeBrowserSession().catch(() => undefined);
+  await ensureBrowserSession({ visible: true });
+
+  process.stderr.write(
+    [
+      '',
+      '[uc] ============================================',
+      '[uc]  Откроется Edge/Chrome с unknowncheats.me',
+      '[uc]  Если Cloudflare/капча — ПРОЙДИ ВРУЧНУЮ',
+      '[uc]  (галочка Verify you are human). Не закрывай окно.',
+      `[uc]  Жду до ${timeoutSec}s…`,
+      '[uc] ============================================',
+      '',
+    ].join('\n'),
+  );
+
+  const waited = await waitForCloudflareInSession(timeoutSec);
+  const imported = await importSessionCookies();
+  const ua = waited.userAgent || getHttpUserAgent();
+
+  let httpStatus: number | null = null;
+  let challenge = true;
+  if (waited.passed) {
     try {
-      jar.setCookieSync(parts.join('; '), ucConfig.baseUrl, { ignoreError: true });
-      count++;
+      const probe = await browserHttp(ucConfig.baseUrl + '/index.php', {
+        timeoutMs: 45_000,
+        autoCf: false,
+      });
+      httpStatus = probe.status;
+      challenge = /Just a moment|challenge-platform|cf-chl-widget|Verify you are human/i.test(probe.html);
+      if (!challenge && probe.status < 400) markCloudflareReady(true);
     } catch {
-      /* skip */
+      httpStatus = null;
     }
   }
-  saveJar();
-  dropCache();
-  return count;
+
+  const httpOk = waited.passed && httpStatus !== null && httpStatus < 400 && !challenge;
+
+  if (!keepOpen && !httpOk) {
+    await closeBrowserSession().catch(() => undefined);
+  }
+
+  if (httpOk) {
+    return {
+      passed: true,
+      cookiesImported: imported,
+      hasClearance: waited.hasClearance,
+      httpStatus,
+      userAgent: ua,
+      browserPath: ucConfig.browserPath,
+      message:
+        `Cloudflare пройден (HTTP ${httpStatus}). Сессия браузера остаётся открытой для uc_* tools. ` +
+        `Cookies: ${path.normalize(ucConfig.cookiesPath)}.`,
+    };
+  }
+
+  return {
+    passed: false,
+    cookiesImported: imported,
+    hasClearance: waited.hasClearance,
+    httpStatus,
+    userAgent: ua,
+    browserPath: ucConfig.browserPath,
+    message:
+      waited.message ||
+      `Cloudflare не пройден за ${timeoutSec}s (title="${waited.title}"). ` +
+        `Пройди капчу в окне браузера и запусти uc_cf_pass снова.`,
+  };
 }
 
 export interface LoginResult {
   loggedIn: boolean;
   username: string | null;
   cookiesImported: number;
+  cfPassed?: boolean;
   message: string;
 }
 
-export async function interactiveLogin(opts: { timeoutSec?: number; keepOpen?: boolean } = {}): Promise<LoginResult> {
-  const pw = await loadPlaywright();
-  fs.mkdirSync(ucConfig.browserProfileDir, { recursive: true });
+export async function interactiveLogin(
+  opts: { timeoutSec?: number; keepOpen?: boolean; cfOnly?: boolean } = {},
+): Promise<LoginResult> {
+  const timeoutSec = opts.timeoutSec ?? ucConfig.loginTimeoutSec;
+  const deadline = Date.now() + timeoutSec * 1000;
+  const keepOpen = opts.keepOpen ?? true;
 
-  let context;
-  try {
-    context = await pw.chromium.launchPersistentContext(ucConfig.browserProfileDir, {
-      ...launchArgs(false),
-      userAgent: ucConfig.userAgent,
-      locale: 'en-US',
-      viewport: { width: 1280, height: 900 },
-    });
-  } catch (err) {
-    throw new BrowserUnavailableError(
-      `Failed to launch Chromium: ${(err as Error).message}. Install: npx playwright install chromium`,
-    );
-  }
+  await closeBrowserSession().catch(() => undefined);
+  const ctx = await ensureBrowserSession({ visible: true });
+  const page = ctx.pages()[0] ?? (await ctx.newPage());
 
-  try {
-    const page = context.pages()[0] ?? (await context.newPage());
+  process.stderr.write(
+    '[uc] Сначала Cloudflare (капча вручную при необходимости), затем логин на форум.\n',
+  );
 
-    // Step 1: Navigate — Cloudflare challenge will auto-solve in a real browser
-    await page.goto(ucConfig.baseUrl + '/index.php', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => undefined);
+  const cf = await waitForCloudflareInSession(timeoutSec);
+  let imported = await importSessionCookies();
 
-    const deadline = Date.now() + (opts.timeoutSec ?? ucConfig.loginTimeoutSec) * 1000;
-
-    // Step 2: Wait for Cloudflare to pass (cf_clearance cookie appears)
-    let cfPassed = false;
-    while (Date.now() < deadline && !cfPassed) {
-      const title = await page.title().catch(() => '');
-      if (/Just a moment/i.test(title)) {
-        await page.waitForTimeout(2000);
-        continue;
-      }
-      cfPassed = true;
-    }
-
-    if (!cfPassed) {
-      // Save whatever cookies we got (might still be useful)
-      const partial = await context.cookies(ucConfig.baseUrl);
-      const imported = importCookies(partial as unknown as BrowserCookie[]);
-      if (!opts.keepOpen) await context.close();
-      return {
-        loggedIn: false,
-        username: null,
-        cookiesImported: imported,
-        message: 'Cloudflare challenge was not resolved in time. Try uc_login again.',
-      };
-    }
-
-    // Step 3: Check if already logged in (from persistent browser profile)
-    let cookies = await context.cookies(ucConfig.baseUrl);
-    let hasUser = cookies.some((c) => c.name === 'bbuserid' && c.value && c.value !== '0');
-
-    if (!hasUser) {
-      // Navigate to login page
-      await page.goto(ucConfig.baseUrl + '/member.php?do=login', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => undefined);
-    }
-
-    // Step 4: Wait for forum login (bbuserid cookie)
-    let username: string | null = null;
-    while (Date.now() < deadline) {
-      cookies = await context.cookies(ucConfig.baseUrl);
-      hasUser = cookies.some((c) => c.name === 'bbuserid' && c.value && c.value !== '0');
-      if (hasUser) {
-        await page.waitForTimeout(1500);
-        const fresh = await context.cookies(ucConfig.baseUrl);
-        const imported = importCookies(fresh as unknown as BrowserCookie[]);
-        username = await page
-          .locator('#navbar_username, .bigusername, .username_container .member_username')
-          .first()
-          .textContent({ timeout: 3000 })
-          .catch(() => null);
-        if (!opts.keepOpen) await context.close();
-        return {
-          loggedIn: true,
-          username: username?.trim() || null,
-          cookiesImported: imported,
-          message: 'Login successful, cookies saved to ' + path.normalize(ucConfig.cookiesPath),
-        };
-      }
-      await page.waitForTimeout(1500);
-    }
-
-    // Timeout — save Cloudflare cookies at least (cf_clearance enables HTTP access even without login)
-    const finalCookies = await context.cookies(ucConfig.baseUrl);
-    const imported = importCookies(finalCookies as unknown as BrowserCookie[]);
-    if (!opts.keepOpen) await context.close();
+  if (!cf.passed) {
+    if (!keepOpen) await closeBrowserSession().catch(() => undefined);
     return {
       loggedIn: false,
       username: null,
       cookiesImported: imported,
-      message: imported > 0
-        ? `Forum login not completed, but ${imported} cookies saved (including Cloudflare clearance). HTTP access to public pages should work now. Run uc_login again to complete forum login.`
-        : `Login not completed within ${opts.timeoutSec ?? ucConfig.loginTimeoutSec}s. Run uc_login again.`,
+      cfPassed: false,
+      message: cf.message || 'Cloudflare not cleared. Complete captcha in the browser window and retry.',
     };
-  } catch (err) {
-    await context.close().catch(() => undefined);
-    throw err;
   }
+
+  markCloudflareReady(true);
+
+  if (opts.cfOnly) {
+    return {
+      loggedIn: false,
+      username: null,
+      cookiesImported: imported,
+      cfPassed: true,
+      message: `Cloudflare OK (${imported} cookies). Browser session kept. For forum login run uc_login without cfOnly.`,
+    };
+  }
+
+  process.stderr.write(
+    '[uc] Cloudflare OK. Войди в аккаунт UnknownCheats в открытом окне (логин/пароль/2FA).\n',
+  );
+
+  let cookies = await ctx.cookies();
+  let hasUser = cookies.some((c: { name: string; value: string }) => c.name === 'bbuserid' && c.value && c.value !== '0');
+  if (!hasUser) {
+    await page
+      .goto(ucConfig.baseUrl + '/member.php?do=login', { waitUntil: 'domcontentloaded', timeout: 30_000 })
+      .catch(() => undefined);
+  }
+
+  let username: string | null = null;
+  while (Date.now() < deadline) {
+    cookies = await ctx.cookies();
+    hasUser = cookies.some((c: { name: string; value: string }) => c.name === 'bbuserid' && c.value && c.value !== '0');
+    if (hasUser) {
+      await page.waitForTimeout(1500);
+      imported = await importSessionCookies();
+      username = await page
+        .locator('#navbar_username, .bigusername, .username_container .member_username')
+        .first()
+        .textContent({ timeout: 3000 })
+        .catch(() => null);
+      return {
+        loggedIn: true,
+        username: username?.trim() || null,
+        cookiesImported: imported,
+        cfPassed: true,
+        message: 'Login OK. Browser session kept for tools. ' + path.normalize(ucConfig.cookiesPath),
+      };
+    }
+    await page.waitForTimeout(1500);
+  }
+
+  imported = await importSessionCookies();
+  return {
+    loggedIn: false,
+    username: null,
+    cookiesImported: imported,
+    cfPassed: true,
+    message:
+      imported > 0
+        ? `Forum login not finished, CF OK (${imported} cookies). Public pages should work. Retry uc_login for account.`
+        : `Login not completed within ${timeoutSec}s.`,
+  };
 }
 
 export async function browserDownload(
   targetUrl: string,
   destDir: string,
-  opts: { headless?: boolean; timeoutMs?: number } = {},
+  opts: { timeoutMs?: number } = {},
 ): Promise<{ filePath: string; suggestedName: string; bytes: number }> {
-  const pw = await loadPlaywright();
   fs.mkdirSync(destDir, { recursive: true });
 
-  const browser = await pw.chromium.launch(launchArgs(opts.headless ?? false)).catch((err: Error) => {
-    throw new BrowserUnavailableError(`Failed to launch Chromium: ${err.message}`);
-  });
-
-  const context = await browser.newContext({
-    userAgent: ucConfig.userAgent,
-    locale: 'en-US',
-    acceptDownloads: true,
-    viewport: { width: 1280, height: 900 },
-  });
+  let own = false;
+  let browser: Awaited<ReturnType<PlaywrightModule['chromium']['launch']>> | null = null;
+  let context;
+  try {
+    context = await ensureBrowserSession({ visible: true });
+  } catch {
+    own = true;
+    const pw = await loadPlaywright();
+    browser = await pw.chromium.launch({
+      headless: false,
+      executablePath: ucConfig.browserPath,
+      args: ['--disable-blink-features=AutomationControlled'],
+      ignoreDefaultArgs: ['--enable-automation'],
+    });
+    context = await browser.newContext({
+      userAgent: getHttpUserAgent(),
+      locale: 'en-US',
+      acceptDownloads: true,
+      viewport: { width: 1280, height: 800 },
+    });
+    await context.addCookies(cookiesForBrowser() as never).catch(() => undefined);
+  }
 
   try {
-    await context.addCookies(cookiesForBrowser() as never).catch(() => undefined);
     const timeout = opts.timeoutMs ?? 120_000;
     const page = await context.newPage();
-
     const downloadPromise = page.waitForEvent('download', { timeout }).catch(() => null);
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => undefined);
 
-    // Try clicking download buttons
-    const selectors = [
-      'a[download]', '#download_button', 'a.download-button',
-      'a[href*="do=download"]', 'button:has-text("Download")', 'a:has-text("Download")',
-    ];
-    for (const sel of selectors) {
+    for (const sel of [
+      'a[download]',
+      '#download_button',
+      'a.download-button',
+      'a[href*="do=download"]',
+      'button:has-text("Download")',
+      'a:has-text("Download")',
+    ]) {
       const loc = page.locator(sel).first();
       if (await loc.count().catch(() => 0)) {
         await loc.click({ timeout: 5000 }).catch(() => undefined);
@@ -215,9 +270,12 @@ export async function browserDownload(
     const filePath = path.join(destDir, suggested);
     await dl.saveAs(filePath);
     const bytes = fs.statSync(filePath).size;
+    await page.close().catch(() => undefined);
     return { filePath, suggestedName: suggested, bytes };
   } finally {
-    await context.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
+    if (own) {
+      await context.close().catch(() => undefined);
+      await browser?.close().catch(() => undefined);
+    }
   }
 }

@@ -1,6 +1,8 @@
 import { ucConfig, ucUrl } from '../config.js';
-import { AuthRequiredError, HttpError } from '../../errors.js';
-import { cookieHeaderFor, storeSetCookies } from './jar.js';
+import { AuthRequiredError, BrowserUnavailableError, HttpError } from '../../errors.js';
+import { cookieHeaderFor, hasCloudflareCookies, storeSetCookies } from './jar.js';
+import { getHttpUserAgent } from '../session-ua.js';
+import { browserHttp } from './browser-fetch.js';
 
 export interface FetchOptions {
   method?: 'GET' | 'POST';
@@ -10,6 +12,10 @@ export interface FetchOptions {
   noCache?: boolean;
   raw?: boolean;
   timeoutMs?: number;
+  /** Force Node fetch (skip browser TLS transport). */
+  forceNode?: boolean;
+  /** Force browser transport. */
+  forceBrowser?: boolean;
 }
 
 export interface PageResult {
@@ -18,6 +24,7 @@ export interface PageResult {
   finalUrl: string;
   loggedIn: boolean;
   securityToken: string | null;
+  via?: 'browser' | 'node';
 }
 
 let chain: Promise<unknown> = Promise.resolve();
@@ -50,6 +57,12 @@ function setCookiesOf(res: Response): string[] {
 
 const htmlCache = new Map<string, { at: number; page: PageResult }>();
 
+function bodyToString(body: string | URLSearchParams | undefined): string | undefined {
+  if (body == null) return undefined;
+  if (typeof body === 'string') return body;
+  return body.toString();
+}
+
 export async function rawFetch(target: string, opts: FetchOptions = {}): Promise<Response> {
   const method = opts.method ?? 'GET';
   let current = ucUrl(target);
@@ -57,10 +70,17 @@ export async function rawFetch(target: string, opts: FetchOptions = {}): Promise
 
   for (let hop = 0; hop < 8; hop++) {
     const headers: Record<string, string> = {
-      'User-Agent': ucConfig.userAgent,
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+      // Must match the browser UA that obtained cf_clearance.
+      'User-Agent': getHttpUserAgent(),
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
       'Upgrade-Insecure-Requests': '1',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Cache-Control': 'max-age=0',
       ...opts.headers,
     };
     const cookie = cookieHeaderFor(current);
@@ -115,7 +135,7 @@ export async function rawFetch(target: string, opts: FetchOptions = {}): Promise
 function detectGate(html: string, status: number, finalUrl: string): string | null {
   // Cloudflare challenge — need browser session to pass
   if (/Just a moment\.\.\.|challenge-platform|cf-chl-widget/i.test(html) && (status === 403 || status === 503)) {
-    return 'Cloudflare challenge detected. Browser login is required to obtain cf_clearance cookie.';
+    return 'Cloudflare challenge detected. Call uc_cf_pass (browser TLS + cf_clearance).';
   }
   if (/\/login\.php|member\.php\?.*do=login|\/members\/login/i.test(finalUrl) && status < 400) {
     return 'Forum redirected to login page.';
@@ -141,33 +161,90 @@ function isLoggedIn(html: string): boolean {
   return false;
 }
 
-export async function getPage(target: string, opts: FetchOptions = {}): Promise<PageResult> {
-  const absolute = ucUrl(target);
-  const cacheKey = absolute;
-  if (!opts.noCache && (opts.method ?? 'GET') === 'GET') {
-    const hit = htmlCache.get(cacheKey);
-    if (hit && Date.now() - hit.at < ucConfig.htmlCacheTtlMs) return hit.page;
-  }
+function isCloudflareChallenge(html: string, status: number): boolean {
+  return (
+    (status === 403 || status === 503) &&
+    /Just a moment|challenge-platform|cf-chl-widget|cdn-cgi\/challenge-platform/i.test(html)
+  );
+}
 
+async function getPageViaBrowser(target: string, opts: FetchOptions): Promise<PageResult> {
+  const absolute = ucUrl(target);
+  const result = await schedule(() =>
+    browserHttp(absolute, {
+      method: opts.method ?? 'GET',
+      body: bodyToString(opts.body),
+      headers: opts.headers,
+      timeoutMs: opts.timeoutMs ?? Math.max(ucConfig.requestTimeoutMs, 45_000),
+    }),
+  );
+
+  return {
+    html: result.html,
+    status: result.status,
+    finalUrl: result.finalUrl || absolute,
+    loggedIn: isLoggedIn(result.html),
+    securityToken: extractSecurityToken(result.html),
+    via: 'browser',
+  };
+}
+
+async function getPageViaNode(target: string, opts: FetchOptions): Promise<PageResult> {
+  const absolute = ucUrl(target);
   const res = await rawFetch(absolute, opts);
   const html = await res.text();
-  const page: PageResult = {
+  return {
     html,
     status: res.status,
     finalUrl: res.url || absolute,
     loggedIn: isLoggedIn(html),
     securityToken: extractSecurityToken(html),
+    via: 'node',
   };
+}
 
-  const gate = detectGate(html, res.status, page.finalUrl);
+/**
+ * Prefer Chrome in-page fetch (real TLS fingerprint). Node fetch keeps failing
+ * Cloudflare even with a valid cf_clearance because JA3/JA4 does not match.
+ */
+export async function getPage(target: string, opts: FetchOptions = {}): Promise<PageResult> {
+  const absolute = ucUrl(target);
+  const cacheKey = `${opts.method ?? 'GET'}:${absolute}`;
+  if (!opts.noCache && (opts.method ?? 'GET') === 'GET') {
+    const hit = htmlCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < ucConfig.htmlCacheTtlMs) return hit.page;
+  }
+
+  // Always prefer Chrome transport for UC — Node TLS fingerprint is rejected
+  // even when cf_clearance is present in the cookie jar.
+  let page: PageResult;
+
+  if (opts.forceNode) {
+    page = await getPageViaNode(absolute, opts);
+  } else {
+    try {
+      page = await getPageViaBrowser(absolute, {
+        ...opts,
+        forceBrowser: opts.forceBrowser || hasCloudflareCookies(),
+      });
+    } catch (err) {
+      if (err instanceof BrowserUnavailableError) {
+        page = await getPageViaNode(absolute, opts);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  const gate = detectGate(page.html, page.status, page.finalUrl);
   if (gate && !opts.allowGate) {
-    throw new AuthRequiredError(gate, absolute, 'Call uc_login to sign in.');
+    throw new AuthRequiredError(gate, absolute, 'Call uc_cf_pass or uc_login.');
   }
-  if (!gate && res.status >= 400 && res.status !== 403) {
-    throw new HttpError(res.status, absolute);
+  if (!gate && page.status >= 400 && page.status !== 403) {
+    throw new HttpError(page.status, absolute);
   }
 
-  if (!opts.noCache && (opts.method ?? 'GET') === 'GET' && res.status === 200) {
+  if (!opts.noCache && (opts.method ?? 'GET') === 'GET' && page.status === 200 && !isCloudflareChallenge(page.html, page.status)) {
     htmlCache.set(cacheKey, { at: Date.now(), page });
     if (htmlCache.size > 200) htmlCache.delete(htmlCache.keys().next().value as string);
   }

@@ -95,6 +95,12 @@ export function cookiesForBrowser(): Array<Record<string, unknown>> {
 export const cookiesFile = path.normalize(ucConfig.cookiesPath);
 
 export function hasSessionCookies(): boolean {
-  const header = cookieHeaderFor(ucConfig.baseUrl);
+  const header = cookieHeaderFor(ucConfig.baseUrl) || cookieHeaderFor('https://www.unknowncheats.me/');
   return /(^|;\s*)bbuserid=/.test(header) || /(^|;\s*)bbsessionhash=/.test(header);
+}
+
+/** Cloudflare clearance present — enough for many public pages without forum login. */
+export function hasCloudflareCookies(): boolean {
+  const header = cookieHeaderFor(ucConfig.baseUrl) || cookieHeaderFor('https://www.unknowncheats.me/');
+  return /(^|;\s*)cf_clearance=/.test(header);
 }
