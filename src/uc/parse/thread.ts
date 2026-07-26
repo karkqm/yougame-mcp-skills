@@ -130,8 +130,11 @@ export function parseThread(html: string, requestedUrl?: string): ThreadPage {
   const canonical = $('link[rel="canonical"]').attr('href') || requestedUrl || '';
   const threadUrl = abs(canonical.replace(/[?#].*$/, '').replace(/\/page-?\d+/i, '')) || null;
 
-  const title = $('h1, .threadtitle, #thread_title, .pagetitle h1, #pagetitle h1, span.threadtitle').first()
+  let title = $('h1, .threadtitle, #thread_title, .pagetitle h1, #pagetitle h1, span.threadtitle').first()
     .text().replace(/\s+/g, ' ').trim();
+  if (!title) {
+    title = $('title').text().replace(/\s+/g, ' ').trim().replace(/\s*[-–—|]\s*UnKnoWnCheaTs.*$/i, '').trim();
+  }
 
   const tags: string[] = [];
   $('.taglist a, .tag-list a, li.tag a').each((_, a) => {
@@ -140,11 +143,16 @@ export function parseThread(html: string, requestedUrl?: string): ThreadPage {
   });
 
   const posts: Post[] = [];
-  // vBulletin post containers
-  $('div[id^="post_"], li[id^="post_"], table[id^="post"]').each((_, el) => {
+  const seenPostIds = new Set<string>();
+  // vBulletin post containers: table[id^="post"] (UC uses table#postNNNN)
+  $('table[id^="post"]').each((_, el) => {
     const $el = $(el);
-    // Skip nested quotes that also have post_ ids
-    if ($el.parents('[id^="post_"]').length > 0) return;
+    const elId = $el.attr('id') || '';
+    // Skip non-container divs (post_message_, postmenu_, etc.)
+    if (/^post_|^postmenu|^postcount/.test(elId)) return;
+    if ($el.parents('table[id^="post"]').length > 0) return;
+    if (seenPostIds.has(elId)) return;
+    seenPostIds.add(elId);
     posts.push(parsePost($, el as Element, threadUrl));
   });
 

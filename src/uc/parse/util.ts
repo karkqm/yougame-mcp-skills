@@ -129,7 +129,8 @@ export function maxPage($: CheerioAPI): number {
 export function breadcrumbs($: CheerioAPI): Array<{ title: string; url: string | null; forumId: number | null }> {
   const out: Array<{ title: string; url: string | null; forumId: number | null }> = [];
   const seen = new Set<string>();
-  $('.breadcrumb a, #breadcrumb a, .navbit a, .navbar_breadcrumbs a').each((_, el) => {
+  // UC breadcrumbs are in nav[itemscope] > ul > li > span.navbar > a
+  $('.breadcrumb a, #breadcrumb a, .navbit a, .navbar_breadcrumbs a, nav[itemscope] .navbar a').each((_, el) => {
     const $el = $(el);
     const href = abs($el.attr('href'));
     const title = $el.text().replace(/\s+/g, ' ').trim();
@@ -137,7 +138,11 @@ export function breadcrumbs($: CheerioAPI): Array<{ title: string; url: string |
     const key = `${title}|${href ?? ''}`;
     if (seen.has(key)) return;
     seen.add(key);
-    out.push({ title, url: href, forumId: forumIdFromUrl(href) });
+    // Check sibling meta for forumdisplay.php?f=N (UC stores actual forum ID there)
+    const $meta = $el.closest('li').find('meta[itemprop="item"]');
+    const metaUrl = $meta.attr('content') || '';
+    const fid = forumIdFromUrl(metaUrl) ?? forumIdFromUrl(href);
+    out.push({ title, url: href, forumId: fid });
   });
   return out;
 }

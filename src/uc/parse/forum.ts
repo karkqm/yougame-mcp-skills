@@ -45,82 +45,92 @@ export interface ForumPage {
   pages: number;
 }
 
-function parseForumNode($: CheerioAPI, el: Cheerio<AnyNode>): ForumNode {
-  const $node = $(el);
-  const $link = $node.find('a[href*="forumdisplay"], a[href*="/forum/"]').first();
-  if (!$link.length) {
-    const $any = $node.find('h2 a, h3 a, .forumtitle a, td a').first();
-    $link.add($any);
-  }
-  const title = $link.text().replace(/\s+/g, ' ').trim() || $node.find('h2, h3, .forumtitle').first().text().replace(/\s+/g, ' ').trim();
+function parseForumRow($: CheerioAPI, $row: Cheerio<AnyNode>): ForumNode {
+  const $forumCell = $row.find('td[id^="f"]').first();
+  const cellId = $forumCell.attr('id') || '';
+  const forumId = cellId.startsWith('f') ? Number.parseInt(cellId.slice(1), 10) : null;
+
+  const $link = $forumCell.find('a[href*="/forum/"]').first();
+  const title = $link.text().replace(/\s+/g, ' ').trim();
   const url = abs($link.attr('href'));
-  const id = idFromAttr($node.attr('id'), 'forum') ?? forumIdFromUrl(url);
 
   const subForums: ForumNode['subForums'] = [];
-  $node.find('.subforums a, .subforum a, .childforumlist a').each((_, a) => {
+  $forumCell.find('.smallfont a[href*="/forum/"]').each((_, a) => {
     const href = abs($(a).attr('href'));
     const t = $(a).text().replace(/\s+/g, ' ').trim();
-    if (t && href) subForums.push({ id: forumIdFromUrl(href), title: t, url: href });
+    if (t && href && href !== url) {
+      const imgBefore = $(a).prev('img');
+      const subId = idFromAttr(imgBefore.attr('id'), 'forum_statusicon_') ?? forumIdFromUrl(href);
+      subForums.push({ id: subId, title: t, url: href });
+    }
   });
 
+  const tds = $row.find('td').toArray();
   let threads: number | null = null;
   let posts: number | null = null;
-  $node.find('td, .forumstats dd, .forumdata dd').each((_, td) => {
-    const text = $(td).text().toLowerCase();
-    const val = parseCount($(td).text());
-    if (text.includes('thread')) threads = threads ?? val;
-    else if (text.includes('post') || text.includes('message')) posts = posts ?? val;
-    else if (threads === null) threads = val;
-    else if (posts === null) posts = val;
-  });
+  if (tds.length >= 2) {
+    posts = parseCount($(tds[tds.length - 1]).text());
+    threads = parseCount($(tds[tds.length - 2]).text());
+  }
 
-  const $last = $node.find('.lastpostinfo a, .lastpost a, .lastthread a').first();
-  const lastThread = $last.length
+  const $lastCell = $row.find('td.alt2 .smallfont').first();
+  const $lastLink = $lastCell.find('a[href*="-new-post"], a[href*="showthread"], a[title]').first();
+  const lastThread = $lastLink.length
     ? {
-        title: $last.attr('title') || $last.text().replace(/\s+/g, ' ').trim(),
-        url: abs($last.attr('href')),
-        date: timeOf($node.find('.lastpostdate, .lastpost .time, .lastpost .date').first()),
-        author: $node.find('.lastpost .username, .lastpostby a').first().text().trim() || null,
+        title: ($lastLink.attr('title') || '').replace(/^Go to first unread post in thread '|'$/g, '') || $lastLink.text().replace(/\s+/g, ' ').trim(),
+        url: abs($lastLink.attr('href')),
+        date: $lastCell.find('.time').parent().text().replace(/\s+/g, ' ').trim() || null,
+        author: $lastCell.find('a[href*="member.php"]').text().trim() || null,
       }
     : null;
 
-  const description =
-    textOf($, $node.find('.forumdescription, .forum-description, .foruminfo p').first()) || null;
-
-  return { id, title, url, description, threads, posts, subForums, lastThread };
+  return {
+    id: forumId ?? forumIdFromUrl(url),
+    title,
+    url,
+    description: null,
+    threads,
+    posts,
+    subForums,
+    lastThread,
+  };
 }
 
 export function parseForumIndex(html: string): { categories: CategoryBlock[]; forums: ForumNode[] } {
   const $ = cheerio.load(html);
   const categories: CategoryBlock[] = [];
-  const seenForums = new Set<string>();
 
-  // UC forum index: categories are tbody or div blocks with forum rows inside
-  $('table.tborder tbody[id^="collapseobj_forumbit_"], .forumbit_post, .category-forum-list').each((_, block) => {
+  // UC structure: table#forum-list-top-N has category title in td.tcat,
+  // table#forum-list-N > tbody#collapseobj_forumbit_N has forum rows.
+  // Forum rows are plain <tr> with td[id^="f"] for the forum cell.
+  $('tbody[id^="collapseobj_forumbit_"]').each((_, block) => {
     const $block = $(block);
-    const $header = $block.prev('thead, .thead').find('a').first();
-    if (!$header.length) return;
-    const catUrl = abs($header.attr('href'));
+    const catNum = ($block.attr('id') || '').replace('collapseobj_forumbit_', '');
+    const $catHeader = $(`table#forum-list-top-${catNum} td.tcat`);
+    const catTitle = $catHeader.find('b').text().trim() || $catHeader.text().trim();
+    if (!catTitle) return;
+
     const forums: ForumNode[] = [];
-    $block.find('tr[id^="forum"], .forumbit_nopost, .forumrow, li[id^="forum"]').each((__, row) => {
-      const key = $(row).attr('id') || '';
-      if (seenForums.has(key) && key) return;
-      if (key) seenForums.add(key);
-      forums.push(parseForumNode($, $(row)));
+    $block.find('tr').each((__, row) => {
+      const $row = $(row);
+      if (!$row.find('td[id^="f"]').length) return;
+      forums.push(parseForumRow($, $row));
     });
+
     categories.push({
-      id: forumIdFromUrl(catUrl),
-      title: $header.text().replace(/\s+/g, ' ').trim(),
-      url: catUrl,
+      id: catNum ? Number.parseInt(catNum, 10) : null,
+      title: catTitle,
+      url: null,
       forums,
     });
   });
 
-  // Fallback: parse all forum rows if category detection didn't work
+  // Fallback: any forum cells on page
   if (!categories.length) {
     const forums: ForumNode[] = [];
-    $('tr[id^="forum"], li[id^="forum"], .forumbit_post').each((_, row) => {
-      forums.push(parseForumNode($, $(row)));
+    $('td[id^="f"]').each((_, cell) => {
+      const $row = $(cell).closest('tr');
+      if ($row.length) forums.push(parseForumRow($, $row));
     });
     if (forums.length) {
       categories.push({ id: null, title: 'Forums', url: null, forums });
@@ -134,43 +144,59 @@ export function parseThreadList(html: string, requestedUrl?: string): ForumPage 
   const $ = cheerio.load(html);
   const threads: ThreadListItem[] = [];
 
-  // Thread rows in various vBulletin layouts
-  $('tr[id^="thread_"], li[id^="thread_"], .threadbit').each((_, el) => {
-    const $t = $(el);
-    const elId = $t.attr('id') || '';
-    const $titleLink = $t.find('a[id^="thread_title_"], .threadtitle a, .title a').first();
+  // UC: thread rows are <tr> containing td[id^="td_threadtitle_"]
+  $('td[id^="td_threadtitle_"]').each((_, cell) => {
+    const $cell = $(cell);
+    const $t = $cell.closest('tr');
+    const cellId = $cell.attr('id') || '';
+    const $titleLink = $cell.find('a[id^="thread_title_"]').first();
     const url = abs($titleLink.attr('href'));
-    const threadId = idFromAttr(elId, 'thread_') ?? threadIdFromUrl(url);
+    const threadId = idFromAttr(cellId, 'td_threadtitle_') ?? threadIdFromUrl(url);
 
-    const prefix = $t.find('.prefix, .threadprefix, span[class*="prefix"]').first().text().replace(/\s+/g, ' ').trim() || null;
     const titleText = $titleLink.text().replace(/\s+/g, ' ').trim();
-    const author = $t.find('.author a, .username, td.alt2 a.username').first().text().trim() || null;
 
+    // Prefix: [Tag] before the title link, or font with Sticky
+    let prefix: string | null = null;
+    const cellText = $cell.text();
+    const prefixMatch = cellText.match(/\[([^\]]+)\]/);
+    if (prefixMatch) prefix = prefixMatch[1].trim();
+
+    // Author: span with onclick containing member URL
+    const authorEl = $cell.find('.smallfont span[onclick*="member"]').first();
+    const author = authorEl.text().trim() || null;
+
+    // Replies/Views from title attribute on last-post td: "Replies: N, Views: N"
     let replies: number | null = null;
     let views: number | null = null;
-    $t.find('td, .threadstats dd, .threadmeta dd').each((__, td) => {
-      const label = $(td).text().toLowerCase();
-      const val = parseCount($(td).text());
-      if (label.includes('repl') || label.includes('ответ')) replies = replies ?? val;
-      else if (label.includes('view') || label.includes('просмотр')) views = views ?? val;
+    $t.find('td[title*="Replies"]').each((__, td) => {
+      const titleAttr = $(td).attr('title') || '';
+      const rMatch = titleAttr.match(/Replies:\s*([\d,]+)/);
+      const vMatch = titleAttr.match(/Views:\s*([\d,]+)/);
+      if (rMatch) replies = parseCount(rMatch[1]);
+      if (vMatch) views = parseCount(vMatch[1]);
     });
-    // Fallback: sequential tds for replies/views
+    // Fallback: last two numeric tds
     if (replies === null || views === null) {
-      const tds = $t.find('td.alt2, td.alt1').toArray();
-      if (tds.length >= 4) {
-        replies = replies ?? parseCount($(tds[tds.length - 3]).text());
-        views = views ?? parseCount($(tds[tds.length - 2]).text());
+      const tds = $t.find('td').toArray();
+      if (tds.length >= 2) {
+        const lastTd = $(tds[tds.length - 1]).text().trim();
+        const prevTd = $(tds[tds.length - 2]).text().trim();
+        if (views === null) views = parseCount(lastTd);
+        if (replies === null) replies = parseCount(prevTd);
       }
     }
 
-    const $lastPost = $t.find('.lastpostdate, .lastpost .time, .threadlastpost').first();
-    const sticky = /sticky|закреп/i.test($t.attr('class') || '') || $t.find('.threadicon img[src*="sticky"]').length > 0;
-    const locked = /locked|закры/i.test($t.attr('class') || '') || $t.find('.threadicon img[src*="lock"]').length > 0;
+    const $lastPost = $t.find('td[title*="Replies"] .smallfont, td.alt2 .smallfont').last();
+    const sticky = $cell.find('img[alt*="Sticky"]').length > 0 || /Sticky/i.test($cell.find('font[color] b').text());
+    const locked = $cell.find('img[alt*="Closed"], img[src*="lock"]').length > 0;
 
     let rating: number | null = null;
-    const ratingText = $t.find('.threadrating img, .rating').first().attr('alt') || '';
-    const ratingMatch = ratingText.match(/(\d+)/);
-    if (ratingMatch) rating = Number.parseInt(ratingMatch[1], 10);
+    const ratingImg = $cell.find('img[alt*="Rating"]').first();
+    const ratingAlt = ratingImg.attr('alt') || '';
+    const ratingMatch = ratingAlt.match(/([\d.]+)\s*average/);
+    if (ratingMatch) rating = Math.round(Number.parseFloat(ratingMatch[1]));
+
+    const lastPostBy = $lastPost.find('a[href*="member.php"]').text().trim() || null;
 
     threads.push({
       id: threadId,
@@ -180,8 +206,8 @@ export function parseThreadList(html: string, requestedUrl?: string): ForumPage 
       author,
       replies,
       views,
-      lastPostAt: timeOf($lastPost),
-      lastPostBy: $t.find('.lastpost .username, .lastpostby a').first().text().trim() || null,
+      lastPostAt: timeOf($lastPost) ?? ($lastPost.find('.time').text().trim() || null),
+      lastPostBy,
       sticky,
       locked,
       rating,
@@ -192,16 +218,25 @@ export function parseThreadList(html: string, requestedUrl?: string): ForumPage 
   const pageMatch = (requestedUrl || canonical).match(/page[=-](\d+)/i);
 
   const subForums: ForumNode[] = [];
-  $('tr[id^="forum"], li[id^="forum"]').each((_, el) => {
-    subForums.push(parseForumNode($, $(el)));
+  $('td[id^="f"]').each((_, cell) => {
+    const $row = $(cell).closest('tr');
+    if ($row.length) subForums.push(parseForumRow($, $row));
   });
+
+  // Forum title from <title> tag (UC has no h1 on forum pages)
+  const rawTitle = $('title').text().replace(/\s+/g, ' ').trim();
+  const forumTitle = rawTitle.replace(/\s*[-–—|]\s*UnKnoWnCheaTs.*$/i, '').trim() || rawTitle;
+
+  // Forum ID from hidden input, URL param, or canonical
+  const forumIdInput = $('input[name="forumid"]').attr('value');
+  const forumId = (forumIdInput ? Number.parseInt(forumIdInput, 10) : null) ??
+    forumIdFromUrl(canonical) ?? forumIdFromUrl(requestedUrl ?? null);
 
   return {
     forum: {
-      id: forumIdFromUrl(canonical) ?? forumIdFromUrl(requestedUrl ?? null),
-      title: $('h1, .forumtitle h1, .pagetitle h1, #pagetitle h1, .forum-title').first().text().replace(/\s+/g, ' ').trim(),
-      description: textOf($, $('meta[name="description"]').first()) ||
-        textOf($, $('.forumdescription').first()) || null,
+      id: forumId,
+      title: forumTitle,
+      description: $('meta[name="description"]').attr('content')?.trim() || null,
     },
     breadcrumbs: breadcrumbs($),
     threads,

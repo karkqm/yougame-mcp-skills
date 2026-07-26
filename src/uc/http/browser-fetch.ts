@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import net from 'node:net';
-import { spawn, type ChildProcess } from 'node:child_process';
+import path from 'node:path';
+import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import { ucConfig, ucUrl } from '../config.js';
 import { BrowserUnavailableError } from '../../errors.js';
 import { saveSessionUserAgent } from '../session-ua.js';
@@ -30,6 +31,54 @@ let ownsBrowserProcess = false;
 
 function log(msg: string): void {
   process.stderr.write(`[uc] ${msg}\n`);
+}
+
+const CDP_STATE_FILE = path.join(ucConfig.home, 'cdp-state.json');
+
+interface CdpState {
+  port: number;
+  pid: number;
+}
+
+function saveCdpState(port: number, pid: number): void {
+  try {
+    fs.mkdirSync(ucConfig.home, { recursive: true });
+    fs.writeFileSync(CDP_STATE_FILE, JSON.stringify({ port, pid }));
+  } catch { /* best effort */ }
+}
+
+function loadCdpState(): CdpState | null {
+  try {
+    return JSON.parse(fs.readFileSync(CDP_STATE_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function clearCdpState(): void {
+  try { fs.unlinkSync(CDP_STATE_FILE); } catch { /* ok */ }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killOrphanedUcBrowser(): void {
+  const state = loadCdpState();
+  if (state && isProcessAlive(state.pid)) {
+    log(`Killing orphaned UC browser (PID ${state.pid}, CDP port ${state.port})`);
+    try { process.kill(state.pid); } catch { /* ok */ }
+    try { process.kill(state.pid, 'SIGKILL'); } catch { /* ok */ }
+    if (process.platform === 'win32') {
+      try { execSync(`taskkill /F /PID ${state.pid} /T`, { stdio: 'ignore', timeout: 5000 }); } catch { /* ok */ }
+    }
+  }
+  clearCdpState();
 }
 
 async function loadPlaywright(): Promise<PlaywrightModule> {
@@ -136,11 +185,13 @@ async function launchBrowserViaCdp(opts: { visible?: boolean } = {}): Promise<An
     windowsHide: false,
   });
   ownsBrowserProcess = true;
+  if (chromeProc.pid) saveCdpState(port, chromeProc.pid);
   chromeProc.on('exit', () => {
     chromeProc = null;
     browser = null;
     context = null;
     cfReady = false;
+    clearCdpState();
   });
 
   await waitForCdp(cdpUrl, 45_000);
@@ -199,6 +250,25 @@ export async function ensureBrowserSession(
 
   if (!launching) {
     launching = (async () => {
+      // 0) Saved CDP state from previous run (orphaned browser)
+      const saved = loadCdpState();
+      if (saved && isProcessAlive(saved.pid)) {
+        const savedUrl = `http://127.0.0.1:${saved.port}`;
+        if (await cdpReady(savedUrl, 2000)) {
+          try {
+            log(`Reconnecting to orphaned UC browser (PID ${saved.pid}, port ${saved.port})`);
+            const ctx = await attachCdp(savedUrl);
+            chromeProc = null;
+            ownsBrowserProcess = false;
+            return ctx;
+          } catch (err) {
+            log(`Reconnect failed: ${(err as Error).message}`);
+          }
+        }
+        killOrphanedUcBrowser();
+        await sleep(1500);
+      }
+
       // 1) Existing CDP (user started browser with --remote-debugging-port)
       const existing = ucConfig.cdpUrl || 'http://127.0.0.1:9222';
       if (await cdpReady(existing, 800)) {
@@ -250,31 +320,22 @@ export async function closeBrowserSession(): Promise<void> {
   context = null;
   chromeProc = null;
 
-  // Only close browser we attached to via connectOverCDP if we own the process;
-  // disconnect without killing user's browser when we attached to external CDP.
   if (b) {
     if (ownsBrowserProcess) {
       await b.close().catch(() => undefined);
     } else {
-      // Disconnect playwright from external browser without closing it
-      try {
-        b.close(); // for CDP, close() disconnects
-      } catch {
-        /* ok */
-      }
+      try { b.close(); } catch { /* disconnect only */ }
     }
   } else if (c && ownsBrowserProcess) {
     await c.close?.().catch(() => undefined);
   }
 
   if (proc && !proc.killed && ownsBrowserProcess) {
-    try {
-      proc.kill();
-    } catch {
-      /* ok */
-    }
+    try { proc.kill(); } catch { /* ok */ }
   }
   ownsBrowserProcess = false;
+
+  killOrphanedUcBrowser();
 }
 
 export function browserSessionAlive(): boolean {
