@@ -117,7 +117,10 @@ async function launchBrowserViaCdp(opts: { visible?: boolean } = {}): Promise<An
     '--no-default-browser-check',
     '--disable-blink-features=AutomationControlled',
     '--disable-dev-shm-usage',
+    // Force on primary monitor — profile may remember last pos off-screen (left of desktop).
+    '--window-position=100,80',
     '--window-size=1280,900',
+    '--start-maximized',
     // New window even if another Edge instance is already running
     '--new-window',
     ucConfig.baseUrl + '/index.php',
@@ -125,11 +128,12 @@ async function launchBrowserViaCdp(opts: { visible?: boolean } = {}): Promise<An
 
   log(`Starting ${pathBase(exe)} (profile=${ucConfig.browserProfileDir})`);
   log('Если увидишь Cloudflare / капчу — пройди её вручную в открывшемся окне. Не закрывай окно.');
+  log('Окно должно быть на основном мониторе (100,80). Не кликай по галочке мышью автоматизации — только руками.');
 
   chromeProc = spawn(exe, args, {
     stdio: 'ignore',
     detached: false,
-    windowsHide: opts.visible === false,
+    windowsHide: false,
   });
   ownsBrowserProcess = true;
   chromeProc.on('exit', () => {
@@ -140,7 +144,39 @@ async function launchBrowserViaCdp(opts: { visible?: boolean } = {}): Promise<An
   });
 
   await waitForCdp(cdpUrl, 45_000);
-  return attachCdp(cdpUrl);
+  const ctx = await attachCdp(cdpUrl);
+  await forceWindowOnScreen(ctx).catch(() => undefined);
+  return ctx;
+}
+
+/** Move browser window onto the visible primary monitor (fixes off-screen left). */
+async function forceWindowOnScreen(ctx: AnyContext): Promise<void> {
+  const page = ctx.pages?.()[0];
+  if (!page) return;
+  const session = await page.context().newCDPSession(page).catch(() => null);
+  if (!session) return;
+  try {
+    const { windowId } = await session.send('Browser.getWindowForTarget');
+    await session.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: { left: 100, top: 80, width: 1280, height: 900, windowState: 'normal' },
+    });
+  } catch {
+    /* older targets */
+  }
+  await page.bringToFront().catch(() => undefined);
+  // JS fallback
+  await page
+    .evaluate(() => {
+      try {
+        window.moveTo(100, 80);
+        window.resizeTo(1280, 900);
+        window.focus();
+      } catch {
+        /* noop */
+      }
+    })
+    .catch(() => undefined);
 }
 
 function pathBase(p: string): string {
@@ -328,23 +364,26 @@ export async function waitForCloudflareInSession(timeoutSec = ucConfig.loginTime
   if (ua) saveSessionUserAgent(ua);
 
   let lastPrompt = 0;
-  let reloads = 0;
-  const started = Date.now();
+  let lastMove = 0;
 
   const promptUser = (title: string) => {
     const now = Date.now();
-    if (now - lastPrompt < 12_000) return;
+    if (now - lastPrompt < 15_000) return;
     lastPrompt = now;
     const left = Math.max(0, Math.ceil((deadline - now) / 1000));
     log('────────────────────────────────────────────');
-    log('CLOUDFLARE / КАПЧА — нужно действие');
+    log('CLOUDFLARE / КАПЧА — нужно действие (только руками!)');
     log(`Страница: "${title.slice(0, 60)}"`);
-    log('1) Найди окно Edge/Chrome с unknowncheats.me');
-    log('2) Пройди проверку (галочка «Verify you are human» / captcha)');
-    log('3) Дождись загрузки форума — не закрывай окно');
+    log('1) Окно Edge должно быть НА ЭКРАНЕ (не слева за монитором)');
+    log('2) Один раз кликни галочку «Verify you are human» / captcha');
+    log('3) Не обновляй страницу и не закрывай окно — жди загрузки форума');
+    log('4) Автоклики отключены: они сбрасывают Turnstile и крутят капчу заново');
     log(`Ожидание ещё ~${left}s…`);
     log('────────────────────────────────────────────');
   };
+
+  // Ensure visible once at start
+  await forceWindowOnScreen(ctx).catch(() => undefined);
 
   while (Date.now() < deadline) {
     try {
@@ -357,6 +396,7 @@ export async function waitForCloudflareInSession(timeoutSec = ucConfig.loginTime
         log('Окно браузера закрыто — перезапускаю. Пройди CF заново.');
         ctx = await ensureBrowserSession({ visible: true });
         page = await mainPage(ctx);
+        await forceWindowOnScreen(ctx).catch(() => undefined);
         await page.goto(ucConfig.baseUrl + '/index.php', { waitUntil: 'domcontentloaded', timeout: 90_000 }).catch(() => undefined);
         ua = await page.evaluate(() => navigator.userAgent).catch(() => ua);
         if (ua) saveSessionUserAgent(ua);
@@ -384,28 +424,15 @@ export async function waitForCloudflareInSession(timeoutSec = ucConfig.loginTime
 
       if (challenged) {
         promptUser(title);
-        await page.bringToFront().catch(() => undefined);
-        // Soft click attempts (user should still complete if turnstile needs real interaction)
-        for (const frame of page.frames()) {
-          const box = frame
-            .locator(
-              'input[type="checkbox"], #challenge-stage input, .ctp-checkbox-label, label.cb-lb, #cf-stage',
-            )
-            .first();
-          if (await box.count().catch(() => 0)) {
-            await box.click({ timeout: 1500 }).catch(() => undefined);
-            break;
-          }
+        // Re-pin window every 20s in case it jumps off-screen again.
+        if (Date.now() - lastMove > 20_000) {
+          lastMove = Date.now();
+          await forceWindowOnScreen(ctx).catch(() => undefined);
         }
       }
 
-      if (challenged && reloads < 1 && Date.now() - started > 40_000) {
-        reloads++;
-        log('Reload challenge page once…');
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => undefined);
-      }
-
-      await page.waitForTimeout(2000).catch(() => undefined);
+      // Poll only — no reloads, no synthetic clicks (they make CF "renew").
+      await page.waitForTimeout(2500).catch(() => undefined);
     } catch (err) {
       const msg = (err as Error).message || '';
       if (/has been closed|Target closed|Browser closed/i.test(msg)) {
